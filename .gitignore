@@ -1,0 +1,11 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+analysis_results/
+logs/
+.repopilot_index/
+analyzed_repo/
