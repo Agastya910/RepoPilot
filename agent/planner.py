@@ -7,6 +7,7 @@ from llm.local_llm_client import LocalLLMClient
 from core.indexer import CodeIndexer
 from core.query_router import QueryRouter, QueryType
 from tools.github_helper import clone_github_repo, get_repo_url_from_query
+from agent.reactor_framework import ReActRunner
 
 
 class Planner:
@@ -25,34 +26,39 @@ class Planner:
     def create_plan(self, user_query: str) -> List[Dict[str, Any]]:
         """
         Create a plan for the user query.
-        
-        Flow:
-        1. Check if user wants to analyze a GitHub repo
-        2. Classify query type
-        3. If metadata: answer locally
-        4. If search/reasoning: retrieve relevant chunks
-        5. Ask LLM to plan given context
+        Uses ReAct for reasoning, but always returns a List[Dict] plan.
         """
-        
-        # Check for GitHub repo in query
-        github_url = get_repo_url_from_query(user_query)
-        if github_url:
-            return self._plan_github_analysis(user_query, github_url)
-        
-        query_type = self.router.classify(user_query)
-        print(f"[PLANNER] Query type: {query_type.value}")
-        
-        # METADATA: Handle locally
-        if query_type == QueryType.METADATA:
-            return self._handle_metadata_query(user_query)
-        
-        # TOOL: Direct execution
-        if query_type == QueryType.TOOL_CALL:
-            return self._extract_tool_calls(user_query)
-        
-        # SEARCH / REASONING: Retrieve + LLM
-        retrieved_context = self._retrieve_context(user_query)
-        return self._plan_with_llm(user_query, retrieved_context, query_type)
+        # 1) Use ReAct to reason
+        react = ReActRunner(self.llm_client, self.repo_path)
+        chunks = self._retrieve_context(user_query)
+        initial_context = {
+            "file_count": len(chunks),
+            "retrieved_chunks": chunks,
+        }
+        result, trace = react.execute(user_query, initial_context)
+        self.trace = trace
+
+        # 2) If ReAct produced a code-search result, wrap it into a plan
+        if isinstance(result, list) and result and isinstance(result[0], dict) and "file_path" in result[0]:
+            # Treat as search_code result
+            return [{
+                "tool_name": "report",
+                "args": {
+                    "message": json.dumps(result, indent=2)
+                },
+            }]
+
+        # 3) If ReAct produced a plain string, report it
+        if isinstance(result, str):
+            return [{
+                "tool_name": "report",
+                "args": {"message": result},
+            }]
+
+        # 4) Fallback: old LLM path if ReAct result unusable
+        chunks = self._retrieve_context(user_query)
+        query_type = self.router.classify(user_query)  # keep your router useful
+        return self._plan_with_llm(user_query, chunks, query_type)
     
     def _plan_github_analysis(self, query: str, github_url: str) -> List[Dict[str, Any]]:
         """Plan for analyzing a GitHub repository."""

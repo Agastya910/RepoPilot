@@ -3,11 +3,6 @@ import time
 import re
 from config import GEMINI_API_KEY
 
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None
 
 class GeminiClient:
     """
