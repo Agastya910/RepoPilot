@@ -86,8 +86,8 @@ class ReActFramework:
         self.streaming_executor = SyncStreamingExecutor(self.llm_client)
         self.repo_path = repo_path
         self.safe_editor = SafeEditor(repo_path)
-        self.max_steps = 5  # Was 10; reduce for responsiveness
-        self.no_progress_limit = 3  # number of consecutive non-progress steps
+        self.max_steps = 4  # Was 10; reduce for responsiveness
+        self.no_progress_limit = 2  # number of consecutive non-progress steps
         self._no_progress_count = 0
         self._last_action = None
         self.steps: List[ReActStep] = []
