@@ -7,7 +7,6 @@ from llm.local_llm_client import LocalLLMClient
 from core.indexer import CodeIndexer
 from core.query_router import QueryRouter, QueryType
 from tools.github_helper import clone_github_repo, get_repo_url_from_query
-from agent.reactor_framework import ReActRunner
 
 
 class Planner:
@@ -26,118 +25,35 @@ class Planner:
     def create_plan(self, user_query: str) -> List[Dict[str, Any]]:
         """
         Create a plan for the user query.
-        For obvious single-file edit requests, use a direct edit plan.
-        Otherwise, use ReAct + fallback LLM analysis.
+        
+        Flow:
+        1. Check if user wants to analyze a GitHub repo
+        2. Classify query type
+        3. If metadata: answer locally
+        4. If search/reasoning: retrieve relevant chunks
+        5. Ask LLM to plan given context
         """
-        # 0) Simple heuristic: detect "edit <file>" pattern
-        edit_plan = self._maybe_plan_edit(user_query)
-        if edit_plan is not None:
-            return edit_plan
-
-        # 1) Use ReAct to reason (analysis / Q&A)
-        react = ReActRunner(self.llm_client, self.repo_path)
-        chunks = self._retrieve_context(user_query)
-        initial_context = {
-            "file_count": len(chunks),
-            "retrieved_chunks": chunks,
-        }
-        result, trace = react.execute(user_query, initial_context)
-        self.trace = trace
-
-        # 2) If ReAct produced a string, report it
-        if isinstance(result, str):
-            return [{
-                "tool_name": "report",
-                "args": {"message": result},
-            }]
-
-        # 3) If ReAct produced a code-search-like list, serialize
-        if isinstance(result, list) and result and isinstance(result[0], dict):
-            return [{
-                "tool_name": "report",
-                "args": {"message": json.dumps(result, indent=2)},
-            }]
-
-        # 4) Fallback to old LLM analysis
+        
+        # Check for GitHub repo in query
+        github_url = get_repo_url_from_query(user_query)
+        if github_url:
+            return self._plan_github_analysis(user_query, github_url)
+        
         query_type = self.router.classify(user_query)
-        return self._plan_with_llm(user_query, chunks, query_type)
+        print(f"[PLANNER] Query type: {query_type.value}")
+        
+        # METADATA: Handle locally
+        if query_type == QueryType.METADATA:
+            return self._handle_metadata_query(user_query)
+        
+        # TOOL: Direct execution
+        if query_type == QueryType.TOOL_CALL:
+            return self._extract_tool_calls(user_query)
+        
+        # SEARCH / REASONING: Retrieve + LLM
+        retrieved_context = self._retrieve_context(user_query)
+        return self._plan_with_llm(user_query, retrieved_context, query_type)
     
-    def _maybe_plan_edit(self, user_query: str) -> List[Dict[str, Any]] | None:
-        """
-        Detect simple single-file edit requests and create a direct edit plan.
-
-        Example:
-        "can you edit the repo_scanner.py to make it scan one more layer..."
-        """
-        lower = user_query.lower()
-        # crude but effective
-        if "edit" not in lower and "change" not in lower and "modify" not in lower:
-            return None
-
-        # Try to extract a filename with .py
-        match = re.search(r"\b([a-zA-Z0-9_]+\.py)\b", user_query)
-        if not match:
-            return None
-
-        file_name = match.group(1)  # e.g. repo_scanner.py
-        file_path = file_name  # tools/ is handled by indexer/context
-
-        # Retrieve the most relevant chunks for that file
-        chunks = self.indexer.search(file_name, k=3)
-        context_str = "\n".join([
-            f"File: {c['file_path']}\n```{c['language']}\n{c['content'][:500]}\n```"
-            for c in chunks
-        ])
-
-        prompt = f"""
-You are editing a Python utility that scans a repository.
-
-User request:
-\"\"\"{user_query}\"\"\"\n
-Current implementation (context from the codebase):
-{context_str if context_str else "[No context found, but file exists in tools/ directory]"}
-    
-Task:
-1. Update {file_name} so that:
-   - It can scan one more level of depth in subdirectories, OR
-   - It allows the caller to specify a maximum depth for scanning.
-2. Keep the public API compatible where possible.
-3. Follow the existing coding style.
-4. Return the full updated content of {file_name}, not a diff.
-
-Respond in this exact JSON format:
-
-{{
-  "file_path": "tools/{file_name}",
-  "description": "What you changed, in 1-2 sentences.",
-  "reasoning": "Brief technical reasoning for the change.",
-  "proposed_content": "FULL updated file content here."
-}}
-"""
-
-        response = self.llm_client.generate_text(prompt)
-
-        # Extract JSON
-        try:
-            json_match = re.search(r"\{.*\}", response, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON in LLM response")
-            edit_data = json.loads(json_match.group())
-        except Exception:
-            # Fallback: just report the raw response
-            return [{
-                "tool_name": "report",
-                "args": {"message": response},
-            }]
-
-        # Plan: just report the JSON to the CLI for now
-        # (SafeEditor integration can come next)
-        pretty = json.dumps(edit_data, indent=2)
-        return [{
-            "tool_name": "report",
-            "args": {"message": pretty},
-        }]
-
     def _plan_github_analysis(self, query: str, github_url: str) -> List[Dict[str, Any]]:
         """Plan for analyzing a GitHub repository."""
         print(f"[PLANNER] GitHub URL detected: {github_url}")
